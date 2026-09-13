@@ -18,6 +18,7 @@ MICRODUCK_WALK_XML: Path = _ROBOT_DIR / "robot_walk.xml"
 MICRODUCK_ALLCOLLISIONS_XML: Path = _ROBOT_DIR / "robot_allcollisions.xml"
 # 70mm / 15g ball prop for the BallKick task.
 MICRODUCK_BALL_XML: Path = _ROBOT_DIR / "ball.xml"
+MICRODUCK_CUSHION_XML: Path = _ROBOT_DIR / "cushion.xml"
 # Roller-skate model: 14 actuated joints + passive wheel hinges (passive_*wheel).
 MICRODUCK_ALLCOLLISIONS_ROLLERS_XML: Path = _ROBOT_DIR / "robot_allcollisions_rollers.xml"
 # Backlash models: every servo joint gets an unactuated passive_<joint>_backlash
@@ -30,6 +31,7 @@ MICRODUCK_ALLCOLLISIONS_ROLLERS_BACKLASH_XML: Path = _ROBOT_DIR / "robot_allcoll
 assert MICRODUCK_WALK_XML.exists(), f"XML not found: {MICRODUCK_WALK_XML}"
 assert MICRODUCK_ALLCOLLISIONS_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_XML}"
 assert MICRODUCK_BALL_XML.exists(), f"XML not found: {MICRODUCK_BALL_XML}"
+assert MICRODUCK_CUSHION_XML.exists(), f"XML not found: {MICRODUCK_CUSHION_XML}"
 assert MICRODUCK_ALLCOLLISIONS_ROLLERS_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_ROLLERS_XML}"
 assert MICRODUCK_ALLCOLLISIONS_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_BACKLASH_XML}"
 assert MICRODUCK_WALK_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_WALK_BACKLASH_XML}"
@@ -56,6 +58,10 @@ def get_walk_rollers_spec() -> mujoco.MjSpec:
 
 def get_ball_spec() -> mujoco.MjSpec:
     return mujoco.MjSpec.from_file(str(MICRODUCK_BALL_XML))
+
+
+def get_cushion_spec() -> mujoco.MjSpec:
+    return mujoco.MjSpec.from_file(str(MICRODUCK_CUSHION_XML))
 
 
 def get_backlash_spec() -> mujoco.MjSpec:
@@ -232,6 +238,12 @@ MICRODUCK_ROLLERS_BACKLASH_ROBOT_CFG = EntityCfg(
 MICRODUCK_BALL_CFG = EntityCfg(
     spec_fn=get_ball_spec,
     init_state=EntityCfg.InitialStateCfg(pos=(0.3, 0.0, 0.035)),
+)
+
+# Static blue cushion / padded wall for SprintCushion task.
+MICRODUCK_CUSHION_CFG = EntityCfg(
+    spec_fn=get_cushion_spec,
+    init_state=EntityCfg.InitialStateCfg(pos=(3.0, 0.0, 0.2)),
 )
 
 # Roller skate robot: the 4 passive wheel joints (passive_*wheel) have no XML

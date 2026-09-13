@@ -67,6 +67,14 @@ from .microduck_roulade_env_cfg import (
     make_microduck_roulade_env_cfg,
     MicroduckRouladeRlCfg,
 )
+from .microduck_sprint_env_cfg import (
+    make_microduck_sprint_env_cfg as make_microduck_sprint_cushion_env_cfg,
+    MicroduckSprintRlCfg as MicroduckSprintCushionRlCfg,
+)
+from .microduck_running_env_cfg import (
+    make_microduck_running_env_cfg,
+    MicroduckRunningRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Standard velocity task
@@ -222,6 +230,26 @@ register_mjlab_task(
     env_cfg=make_microduck_roulade_env_cfg(),
     play_env_cfg=make_microduck_roulade_env_cfg(play=True),
     rl_cfg=MicroduckRouladeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Sprint (DuckEMW recipe, verbatim from emwstudio/microduck_rl) — straight-line
+# barefoot speed specialisation; the task id matches DuckEMW's upstream exactly.
+register_mjlab_task(
+    task_id="Mjlab-Sprint-Flat-MicroDuck",
+    env_cfg=make_microduck_sprint_cushion_env_cfg(),
+    play_env_cfg=make_microduck_sprint_cushion_env_cfg(play=True),
+    rl_cfg=MicroduckSprintCushionRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Running — forward-only max-speed dash (running_forward_progress reward + speed
+# curriculum). Ported from Vottivott/microduck-playground (DuckEMW's ~2.0 m/s recipe).
+register_mjlab_task(
+    task_id="Mjlab-Running-Flat-MicroDuck",
+    env_cfg=make_microduck_running_env_cfg(),
+    play_env_cfg=make_microduck_running_env_cfg(play=True),
+    rl_cfg=MicroduckRunningRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

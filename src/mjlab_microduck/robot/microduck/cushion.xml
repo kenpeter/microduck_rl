@@ -1,0 +1,10 @@
+<mujoco model="microduck_cushion">
+    <compiler angle="radian" autolimits="true"/>
+    <worldbody>
+        <!-- Blue padded wall / cushion: 0.6 x 0.6 x 0.4 m (w x d x h), blue rgba.
+             Static body (no freejoint) placed via initial pos in EntityCfg. -->
+        <body name="cushion" pos="3 0 0.2">
+            <geom type="box" name="cushion_geom" size="0.3 0.3 0.2" rgba="0.2 0.4 1 1" friction="0.8 0.1 0.1" solref="0.02 1" solimp="0.9 0.95 0.001 0.5 2"/>
+        </body>
+    </worldbody>
+</mujoco>

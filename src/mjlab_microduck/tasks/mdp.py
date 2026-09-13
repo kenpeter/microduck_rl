@@ -3375,6 +3375,131 @@ def velocity_tracking_std_curriculum(
     return torch.tensor([current_std])
 
 
+def feet_air_time_forward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    threshold_min: float = 0.05,
+    threshold_max: float = 0.5,
+    command_name: str = "twist",
+    command_threshold: float = 0.1,
+) -> torch.Tensor:
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    current_air_time = sensor.data.current_air_time
+    assert current_air_time is not None
+    in_range = (current_air_time > threshold_min) & (current_air_time < threshold_max)
+    reward = torch.sum(in_range.float(), dim=1)
+    in_air = current_air_time > 0
+    num_in_air = torch.sum(in_air.float())
+    mean_air_time = torch.sum(current_air_time * in_air.float()) / torch.clamp(num_in_air, min=1)
+    env.extras["log"]["Metrics/air_time_mean"] = mean_air_time
+    command = env.command_manager.get_command(command_name)
+    cmd_vx = command[:, 0]
+    vx = env.scene["robot"].data.root_link_lin_vel_b[:, 0]
+    progress = torch.clamp(vx / torch.clamp(cmd_vx, min=1e-3), 0.0, 1.0)
+    env.extras["log"]["Metrics/air_time_forward_progress"] = progress.mean()
+    # Real measured forward speed (body-frame root lin vel x), mean over envs.
+    # Gives an actual top-speed scalar instead of inferring from error_vel_xy.
+    env.extras["log"]["Metrics/forward_speed_mean"] = vx.mean()
+    scale = (cmd_vx > command_threshold).float()
+    return reward * progress * scale
+
+
+def gait_phase_clock(
+    env: ManagerBasedRlEnv,
+    period: float = 0.35,
+) -> torch.Tensor:
+    """Phase-guided gait clock (PGTT/CLF-RL style): sin/cos of the gait phase.
+
+    Gives the policy explicit temporal structure so a flight phase (both feet
+    airborne) is learnable instead of emerging from a blind reward. Phase = 2*pi *
+    (episode_time / period); period ~0.35 s ~ a fast sprint cadence for a 25 cm
+    duck. Returns (B, 2): [sin(phi), cos(phi)].
+    """
+    # episode_length_buf is the per-env step counter since last reset.
+    steps = env.episode_length_buf.float()
+    dt = env.step_dt
+    t = steps * dt  # seconds since last reset
+    phi = 2.0 * math.pi * (t / period)
+    return torch.stack([torch.sin(phi), torch.cos(phi)], dim=-1)
+
+
+def feet_no_double_support(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str = "twist",
+    command_threshold: float = 1.0,
+    weight_floor: float = 0.0,
+) -> torch.Tensor:
+    """Penalise BOTH feet grounded simultaneously (the waddle) — the learnable
+    inverse of a bound. A flight phase requires at least one foot off the ground;
+    rewarding that (penalising double-support) is far easier to learn than asking
+    for both-up. Forward-gated so it only applies at sprint commands.
+    """
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    found = sensor.data.found  # (B, 2) left/right foot contact
+    both_down = (found > 0).all(dim=1).float()  # (B,) 1 when waddling
+    command = env.command_manager.get_command(command_name)
+    cmd_vx = command[:, 0]
+    scale = (cmd_vx > command_threshold).float()
+    return -(both_down * scale)  # negative reward when double-support at speed
+
+
+def bound_reference_track(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str = "twist",
+    command_threshold: float = 1.0,
+    period: float = 0.35,
+    std: float = 0.04,
+    stand_z: float = 0.125,
+    flight_z: float = 0.165,
+) -> torch.Tensor:
+    """CLF-RL-style bound REFERENCE trajectory (paper 2): give the policy a
+    concrete flight-phase shape to track, instead of hoping a penalty invents one.
+
+    Trunk height targets a sinusoid over the gait phase: COIL (dip) at phase 0.0,
+    LAUNCH+FLIGHT (rise to flight_z) at phase 0.25-0.75, LAND (back to stand_z) at
+    phase 1.0. The airborne window (high trunk) is exactly when BOTH feet should
+    be off the ground — so tracking this height reference *structures* the bound:
+    the robot must leave the ground to reach flight_z. Forward-gated to sprint cmds.
+    Exponential reward on trunk_z vs the phase target (the CLF tracking term).
+    """
+    steps = env.episode_length_buf.float()
+    phi = (steps * env.step_dt / period) % 1.0  # (B,) gait phase in [0,1)
+    # height target: stand at phase 0/1, flight peak at phase 0.5 (sin(2pi*phi))
+    target_z = stand_z + (flight_z - stand_z) * torch.sin(2.0 * math.pi * phi).clamp(min=0.0)
+    asset = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    command = env.command_manager.get_command(command_name)
+    cmd_vx = command[:, 0]
+    scale = (cmd_vx > command_threshold).float()
+    track = torch.exp(-((z - target_z) / std) ** 2)
+    return track * scale
+
+
+def air_time_window_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    reward_name: str,
+    window_stages: list[dict],
+) -> torch.Tensor:
+    del env_ids
+    reward_term_cfg = env.reward_manager.get_term_cfg(reward_name)
+    current_min = window_stages[0]["threshold_min"]
+    current_max = window_stages[0]["threshold_max"]
+    for stage in window_stages:
+        if env.common_step_counter > stage["step"]:
+            current_min = stage["threshold_min"]
+            current_max = stage["threshold_max"]
+    reward_term_cfg.params["threshold_min"] = current_min
+    reward_term_cfg.params["threshold_max"] = current_max
+    return torch.tensor([current_min])
+
+
 def push_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -3499,6 +3624,101 @@ def com_range_curriculum(
 
     event_cfg.params["ranges"] = (-current_range, current_range)
     return torch.tensor([current_range])
+
+
+def cushion_contact_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "cushion_contact",
+) -> torch.Tensor:
+    """One-shot bonus when trunk/head contacts the blue cushion."""
+    sensor = env.scene.sensors[sensor_name]  # type: ignore
+    found = sensor.data.found  # (N,1)
+    return found.float().squeeze(-1)
+
+
+def progress_to_cushion(
+    env: ManagerBasedRlEnv,
+    target_x: float = 3.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward reduction in distance to cushion (world X)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    x = asset.data.root_link_pos_w[:, 0]
+    # progress = target - |target - x|  -> higher as x -> target, use direct -dist
+    dist = torch.clamp(torch.tensor(target_x, device=x.device) - x, min=0.0)
+    return -dist * 0.1  # small dense shaping; main is velocity
+
+def heading_to_cushion_reward(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward facing +X (yaw ~0). 1 when facing cushion, 0 when sideways."""
+    asset: Entity = env.scene[asset_cfg.name]
+    quat = asset.data.root_link_quat_w
+    # yaw from quat: atan2(2*(w*z + x*y), 1-2*(y^2+z^2))
+    w, qx, qy, qz = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    yaw = torch.atan2(2*(w*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
+    return torch.cos(yaw).clamp(min=0.0)
+
+
+def h_slip_reward(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    sensor_name: str = "feet_ground_contact",
+) -> torch.Tensor:
+    """GaitSpan H-SLIP simplified: flight + rebound gated by velocity tracking.
+    flight: 1 when both feet off ground, compression/rebound via trunk height velocity.
+    Gated by vx tracking so flight only pays when actually moving toward cushion.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    # flight: no foot contact
+    try:
+        sensor = env.scene.sensors[sensor_name]  # type: ignore
+        contact = sensor.data.found.squeeze(-1)  # (N,1) or (N,2)
+        if contact.dim() == 2 and contact.shape[1] == 2:
+            flight = (contact.sum(dim=1) == 0).float()
+        else:
+            flight = (contact == 0).float().squeeze(-1) if contact.numel() > env.num_envs else torch.zeros(env.num_envs, device=env.device)
+    except:
+        flight = torch.zeros(env.num_envs, device=env.device)
+    vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
+    vx = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 0], nan=0.0)
+    # gate flight by forward speed >0.5 m/s toward cushion
+    gate = torch.sigmoid((vx - 0.5) * 5.0)
+    # rebound: positive vz while in flight (push-off), compression negative
+    rebound = torch.clamp(vz, min=0.0).clamp(max=1.0)
+    return gate * (flight * 0.5 + flight * rebound * 0.5)
+
+
+def sprint_forward_velocity(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Dense forward velocity toward +X (cushion direction), world frame."""
+    asset: Entity = env.scene[asset_cfg.name]
+    vx = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 0], nan=0.0)
+    return torch.clamp(vx, min=0.0)
+
+
+def randomize_cushion_pos(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    asset_name: str = "cushion",
+    distance_range: tuple[float, float] = (2.5, 4.0),
+    lateral_range: tuple[float, float] = (-0.3, 0.3),
+):
+    asset: Entity = env.scene[asset_name]
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    n = len(env_ids)
+    d = torch.rand(n, device=env.device) * (distance_range[1] - distance_range[0]) + distance_range[0]
+    y = torch.rand(n, device=env.device) * (lateral_range[1] - lateral_range[0]) + lateral_range[0]
+    # set root pos (cushion has single body)
+    pos = asset.data.root_link_pos_w[env_ids].clone()
+    pos[:, 0] = env.scene.env_origins[env_ids, 0] + d
+    pos[:, 1] = env.scene.env_origins[env_ids, 1] + y
+    pos[:, 2] = 0.2
+    asset.write_root_link_pose_to_sim(pos, env_ids)
 
 
 def slope_move_masks(distance: "torch.Tensor", size_x: float):
@@ -4904,6 +5124,282 @@ def heading_hold_reward(
     err = yaw - env._heading_ref
     err = torch.atan2(torch.sin(err), torch.cos(err))  # wrap to [-π, π]
     return torch.exp(-(err ** 2) / std ** 2)
+
+
+# --- Running / sprint reward set (ported from Vottivott/microduck-playground,
+#     the recipe DuckEMW used to reach ~2.0 m/s real forward speed). Rewards the
+#     MEASURED forward body velocity, not the velocity-command tracking error. ---
+def running_forward_progress_from_velocity(
+    velocity_x: torch.Tensor,
+    speed_cap: float = 1.2,
+) -> torch.Tensor:
+    """Linear forward-speed objective used by the running task.
+
+    Unlike forward_speed_reward, this deliberately does not saturate at ordinary
+    walking speed. Backward motion receives no reward and very large velocities are
+    capped so a single physics outlier cannot become a jackpot.
+    """
+    if speed_cap <= 0.0:
+        raise ValueError("speed_cap must be positive")
+    velocity_x = torch.nan_to_num(velocity_x, nan=0.0, posinf=speed_cap, neginf=0.0)
+    return torch.clamp(velocity_x, min=0.0, max=speed_cap) / speed_cap
+
+
+def running_forward_progress(
+    env: ManagerBasedRlEnv,
+    speed_cap: float = 1.2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward forward trunk speed with useful gradient above walking speeds."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return running_forward_progress_from_velocity(
+        asset.data.root_link_lin_vel_b[:, 0], speed_cap=speed_cap
+    )
+
+
+def running_flight_event(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    min_forward_speed: float = 0.3,
+    max_tilt_deg: float = 50.0,
+    min_airborne_steps: int = 3,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Pay once when a stable, forward-moving flight phase begins.
+
+    Intentionally an *event*, not an airtime reward: extending an uncontrolled
+    ballistic phase never increases return. Requiring three consecutive 50 Hz
+    samples rejects one-frame contact-sensor flicker.
+    """
+    if min_airborne_steps < 1:
+        raise ValueError("min_airborne_steps must be at least one")
+    sensor = env.scene[sensor_name]
+    contacts = sensor.data.found.reshape(env.num_envs, -1).any(dim=-1)
+    airborne = ~contacts
+
+    air_steps = getattr(env, "_running_airborne_steps", None)
+    if air_steps is None or air_steps.shape != airborne.shape:
+        air_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    fresh_episode = env.episode_length_buf == 0
+    air_steps = torch.where(airborne, air_steps + 1, torch.zeros_like(air_steps))
+    air_steps = torch.where(fresh_episode, torch.zeros_like(air_steps), air_steps)
+    onset = air_steps == min_airborne_steps
+    env._running_airborne_steps = air_steps
+
+    asset: Entity = env.scene[asset_cfg.name]
+    forward = torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 0], nan=0.0)
+    gravity_z = torch.nan_to_num(asset.data.projected_gravity_b[:, 2], nan=0.0)
+    max_tilt_cos = math.cos(math.radians(max_tilt_deg))
+    stable = (-gravity_z) >= max_tilt_cos
+    return (onset & stable & (forward >= min_forward_speed)).float()
+
+
+def running_planar_drift_cost_from_values(
+    lateral_velocity: torch.Tensor,
+    yaw_rate: torch.Tensor,
+    lateral_command: torch.Tensor,
+    yaw_command: torch.Tensor,
+    lateral_weight: float = 4.0,
+) -> torch.Tensor:
+    """Positive straight-line error cost; use with a negative reward weight."""
+    lateral_error = torch.nan_to_num(lateral_velocity - lateral_command, nan=0.0)
+    yaw_error = torch.nan_to_num(yaw_rate - yaw_command, nan=0.0)
+    return yaw_error.square() + lateral_weight * lateral_error.square()
+
+
+def running_planar_drift_cost(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    lateral_weight: float = 4.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize body-frame lateral drift and yaw-rate command error."""
+    asset: Entity = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    return running_planar_drift_cost_from_values(
+        asset.data.root_link_lin_vel_b[:, 1],
+        asset.data.root_link_ang_vel_b[:, 2],
+        command[:, 1],
+        command[:, 2],
+        lateral_weight=lateral_weight,
+    )
+
+
+def running_cadence(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    cap: float = 3.5,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward high step-cycle frequency (leg cycling) a la Su Bingtian.
+
+    Counts per-foot contact<->air transitions each env step and returns the
+    rate (edges per second). A small biped buys speed with cadence, not stride
+    length, so more cycles per second = the right signal. Ramps with the
+    current speed-band progress so it does not disturb early locomotion.
+    """
+    sensor = env.scene[sensor_name]
+    contacts = sensor.data.found.reshape(env.num_envs, -1)[:, :2].float()
+    prev = getattr(env, "_running_prev_contacts", None)
+    if prev is None or prev.shape != contacts.shape:
+        prev = contacts.clone()
+    fresh = env.episode_length_buf == 0
+    if fresh.any():
+        prev = torch.where(fresh.unsqueeze(-1), contacts.clone(), prev)
+    edges = (contacts != prev).float().sum(dim=-1)
+    env._running_prev_contacts = contacts.clone()
+    ramp = _running_su_ramp(env)
+    env._running_speed_cap = cap
+    return edges * 50.0 * ramp
+
+
+def running_fast_ground_touch(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    cap: float = 3.5,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward brief, stiff ground contact (ankle stiffness, fast touch).
+
+    Returns the airborne fraction of the two feet: high = short stance time,
+    quick push-off. That is exactly what a stiff ankle joint buys a sprinter.
+    Ramps with speed-band progress.
+    """
+    sensor = env.scene[sensor_name]
+    contacts = sensor.data.found.reshape(env.num_envs, -1)[:, :2].float()
+    ramp = _running_su_ramp(env)
+    env._running_speed_cap = cap
+    return (1.0 - contacts).mean(dim=-1) * ramp
+
+
+def running_explosive_accel(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    speed_cap: float = 1.2,
+    cap: float = 3.5,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward forward acceleration, weighted up at low speed (explosive start).
+
+    Su's edge is the block start: reach speed FAST. We pay for positive forward
+    acceleration, amplified while the duck is still below its commanded speed.
+    Ramps with speed-band progress.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    vx = torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 0], nan=0.0)
+    prev_vx = getattr(env, "_running_prev_vx", None)
+    if prev_vx is None or prev_vx.shape != vx.shape:
+        prev_vx = vx.clone()
+    fresh = env.episode_length_buf == 0
+    if fresh.any():
+        prev_vx = torch.where(fresh, vx.clone(), prev_vx)
+    accel = vx - prev_vx
+    env._running_prev_vx = vx.clone()
+    command = env.command_manager.get_command(command_name)[:, 0]
+    low_speed = torch.clamp((command - vx) / (command.abs() + 1e-3), 0.0, 1.0)
+    ramp = _running_su_ramp(env)
+    env._running_speed_cap = cap
+    return torch.clamp(accel, min=0.0) * (0.3 + low_speed) * 10.0 * ramp
+
+
+def running_command_ranges_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    speed_stages: list[dict],
+    gate_on_performance: bool = False,
+    gate_margin: float = 0.10,
+    gate_min_steps: int = 500,
+) -> torch.Tensor:
+    """Advance a forward-only running speed band over training.
+
+    A band avoids spending most samples near zero while an explicit standing
+    bucket in the command cfg still trains the deployment idle state.
+
+    When ``gate_on_performance`` is True the band does NOT advance to the next
+    stage until the policy's measured mean forward speed reaches the current
+    stage's ``max_speed`` (minus ``gate_margin``), and at least ``gate_min_steps``
+    have elapsed since entering the stage. This is an achievement-gated
+    curriculum: the duck must actually *reach* each speed before the command is
+    pushed higher, so it consolidates 1.40 -> 1.45 -> 1.50 ... instead of
+    skipping past a speed it has not mastered.
+    """
+    del env_ids
+
+    from typing import cast
+
+    from mjlab.tasks.velocity.mdp.velocity_command import UniformVelocityCommandCfg
+
+    command_term = env.command_manager.get_term(command_name)
+    assert command_term is not None, f"Command term '{command_name}' not found"
+    cfg = cast(UniformVelocityCommandCfg, command_term.cfg)
+
+    # Measured mean forward speed over the LAST completed control step window,
+    # shared on the env and reset per episode. This matches the displacement
+    # metric that eval_sprint_speed.py reports, so the gate advances on the
+    # same "did the duck actually reach this speed" signal the eval uses.
+    # We keep a short EMA of the per-step mean body-x velocity as a cheap proxy
+    # for that windowed mean.
+    ema = getattr(env, "_running_speed_ema", None)
+    if ema is None:
+        ema = float("nan")
+    asset = env.scene[_DEFAULT_ASSET_CFG.name]
+    fwd = asset.data.root_link_lin_vel_b[:, 0]
+    # Mean across envs of the instantaneous forward velocity this step.
+    fwd_mean = float(fwd.mean().item())
+    if math.isnan(ema):
+        ema = fwd_mean
+    else:
+        # Slower EMA (0.001) so it reflects a sustained mean, not step jitter.
+        ema = 0.999 * ema + 0.001 * fwd_mean
+    setattr(env, "_running_speed_ema", ema)
+
+    # Default: iterate stages by step counter (original behaviour).
+    current_min = float(speed_stages[0]["min_speed"])
+    current_max = float(speed_stages[0]["max_speed"])
+    if gate_on_performance:
+        # Stay at the current command band until the measured mean speed
+        # actually MATCHES that command (ema >= current_max - gate_margin).
+        # Only then advance to the next rung. So the duck holds at, say, 1.2 m/s
+        # until it genuinely runs 1.2 mean, then creeps to 1.25, etc. — it never
+        # skips ahead to a higher command it cannot yet fulfill.
+        for idx in range(1, len(speed_stages)):
+            stage = speed_stages[idx]
+            step_ok = env.common_step_counter >= stage["step"]
+            # Match the CURRENT band's target, not the previous stage's.
+            speed_ok = (not math.isnan(ema)) and (ema >= current_max - gate_margin)
+            if step_ok and speed_ok:
+                current_min = float(stage["min_speed"])
+                current_max = float(stage["max_speed"])
+            else:
+                break
+    else:
+        for stage in speed_stages:
+            if env.common_step_counter >= stage["step"]:
+                current_min = float(stage["min_speed"])
+                current_max = float(stage["max_speed"])
+
+    if not (0.0 <= current_min <= current_max):
+        raise ValueError(f"invalid running speed band: {(current_min, current_max)}")
+
+    cfg.ranges.lin_vel_x = (current_min, current_max)
+    # Publish the active band max so reward terms can ramp by speed progress.
+    env._running_speed_band_max = current_max
+    return torch.tensor([current_max], device=env.device)
+
+
+def _running_su_ramp(env: ManagerBasedRlEnv) -> float:
+    """Progress fraction (0..1) of the current speed band vs the top band.
+
+    Lets Su-style sprint rewards (cadence, fast touch, explosive accel) start
+    near zero at low speed and grow as the curriculum pushes toward its cap, so
+    they do not destabilise early locomotion. Returns 1.0 if the cap is unknown.
+    """
+    band_max = getattr(env, "_running_speed_band_max", None)
+    cap = getattr(env, "_running_speed_cap", None)
+    if band_max is None or cap in (None, 0.0):
+        return 1.0
+    return float(min(1.0, max(0.0, band_max / cap)))
 
 
 def action_over_limit_penalty(
