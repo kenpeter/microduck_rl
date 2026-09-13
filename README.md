@@ -77,6 +77,8 @@ instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 | `Mjlab-RollerSlope-Flat-MicroDuck` | slope | Glide down slopes on rollers |
 | `Mjlab-RollerStandUp-Flat-MicroDuck` | flat | Stand up from the ground onto the wheels |
 | `Mjlab-Spin-Flat-MicroDuck` | flat | Fast spin in place on rollers |
+| `Mjlab-Sprint-Flat-MicroDuck` | flat | Straight-line barefoot speed specialisation (DuckEMW recipe) |
+| `Mjlab-Running-Flat-MicroDuck` | flat | Forward-only max-speed dash with speed curriculum |
 
 At deployment the runtime hot-swaps these policies (walk / recover / trick)
 behind a shared 61-dimensional observation contract, so any of them can take
@@ -103,6 +105,22 @@ output side of the play, both the firmware PD emulation
 read *through* the backlash (`qpos[servo] + qpos[backlash]`). Observation and
 action dims are unchanged, so ONNX export and the runtime need no changes.
 See `src/mjlab_microduck/tasks/backlash.py`.
+
+### Running / sprint speed (this fork)
+
+Latest honest eval of `Mjlab-Running-Flat-MicroDuck`
+(checkpoint `logs/rsl_rl/running/2026-09-12_16-16-33_running-max-speed/model_76500.pt`,
+world-frame displacement over 8 s, 64 envs, `scripts/eval_sprint_speed.py`, 2026-09-13):
+
+| cmd (m/s) | mean | p10 | p90 | max | resets |
+|---|---|---|---|---|---|
+| 0.4 | 0.11 | 0.00 | 0.31 | 0.45 | 16 |
+| 0.8 | 1.27 | 0.81 | 1.62 | 1.82 | 4 |
+| 1.2 | 1.55 | 1.18 | 1.79 | 1.86 | 2 |
+| 1.6 | 1.61 | 1.28 | 1.85 | 1.91 | 4 |
+| 2.0 | 1.66 | 1.49 | 1.85 | 1.93 | 1 |
+
+Goal (mean 2.0 @ cmd 2.0) not yet reached — training was still climbing.
 
 ## Actuator model
 
